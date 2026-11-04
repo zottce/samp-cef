@@ -500,6 +500,9 @@ pub fn mainloop() {
                 }
 
                 Event::NetworkJoined => {
+                    // VSL: a CEF server answered -> hide the old SA-MP chat right away (connect lines);
+                    // the server unlocks it again if its page cannot load
+                    crate::vsl::set_locked(true);
                     app.connected = true;
                     app.bad_version_notified = false;
                     app.reset_connect_backoff();
