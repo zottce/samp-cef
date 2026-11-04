@@ -9,9 +9,17 @@
 //!  * "vsl:gameset"  key value - "hud" 0/1 (show the GTA HUD), "fps" 0/1 (frame limiter)
 //!  * "vsl:gameget"        - answer "vsl:gamecfg" hud fps
 //!  * "vsl:nativemenu"     - open the GTA pause menu (settings the VSL menu does not have)
-//!  * "vsl:quitgame"       - leave the game (SA-MP /q)
-//! Any connection reset unlocks everything and restores the player's own settings: other servers
-//! are never touched.
+//!  * "vsl:quitgame"       - leave the game now
+//! Events from the page (read before they go to the server):
+//!  * "vsl:beat"           - the page is alive (every 2 s, never sent to the server). Watchdog: while
+//!                           the chat is locked and the page stays silent (8 s; 30 s for the first page
+//!                           load) the old SA-MP chat and GTA HUD come back until the page beats again.
+//!  * "vsl:ui" "quit"      - sent on to the server (it saves + closes the session), then the game exits
+//!  * "vsl:say" ch hex     - a SA-MP client command typed in the VSL chat (/q, /quit, /fpslimit,
+//!                           /headmove, /dl, /timestamp ...) runs in the game like in the old chat
+//! Any connection reset unlocks everything and restores the player's own settings (the old chat then
+//! shows SA-MP's own "server closed the connection" / ban lines): other servers are never touched.
+//! Leaving with the VSL quit never unlocks (no flash of the old chat while the game closes).
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,6 +36,17 @@ static HUD_WANTED: AtomicBool = AtomicBool::new(false); // player choice: show t
 static SAVED_HUD: AtomicI32 = AtomicI32::new(-1);
 static LAST_HUD_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_HUD: std::sync::Mutex<[i32; 11]> = std::sync::Mutex::new([i32::MIN; 11]);
+
+// watchdog + quit
+static WD_OPEN: AtomicBool = AtomicBool::new(false); // page silent: SA-MP chat / HUD shown again
+static LAST_BEAT_MS: AtomicU64 = AtomicU64::new(0); // 0 = the page has not beaten yet
+static LOCK_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
+static QUITTING: AtomicBool = AtomicBool::new(false);
+static QUIT_AT_MS: AtomicU64 = AtomicU64::new(0);
+const BEAT_TIMEOUT_MS: u64 = 8000;
+const FIRST_BEAT_TIMEOUT_MS: u64 = 30000;
+const QUIT_DELAY_MS: u64 = 300; // time for "vsl:ui quit" to leave the network thread
 
 /// CChat::m_nMode (0 off, 1 light, 2 full) - same place in 0.3.7-R1, R3 and 0.3.DL-R1.
 const CHAT_MODE_OFFSET: usize = 0x8;
@@ -77,48 +96,118 @@ fn menu_byte(offset: usize) -> *mut u8 {
 }
 
 // ------------------------------------------------------------------ chat lock
+fn restore_chat() {
+    let saved = SAVED_MODE.swap(-1, Ordering::Relaxed);
+
+    if saved > 0 {
+        if let Some(chat) = chat_ptr() {
+            unsafe { (chat.add(CHAT_MODE_OFFSET) as *mut i32).write_unaligned(saved) };
+        }
+    }
+}
+
 pub fn set_locked(lock: bool) {
     let was = LOCKED.swap(lock, Ordering::SeqCst);
 
-    if was && !lock {
-        let saved = SAVED_MODE.swap(-1, Ordering::Relaxed);
+    if lock && !was {
+        LOCK_SINCE_MS.store(now_ms(), Ordering::Relaxed);
+    }
 
-        if saved > 0 {
-            if let Some(chat) = chat_ptr() {
-                unsafe { (chat.add(CHAT_MODE_OFFSET) as *mut i32).write_unaligned(saved) };
-            }
-        }
+    if was && !lock {
+        restore_chat();
+        WD_OPEN.store(false, Ordering::Relaxed);
+        LAST_BEAT_MS.store(0, Ordering::Relaxed);
     }
 
     tracing::info!(locked = lock, "VSL chat lock");
 }
 
+/// locked by the server and the page is alive
 pub fn is_locked() -> bool {
-    LOCKED.load(Ordering::Relaxed)
+    LOCKED.load(Ordering::Relaxed) && !WD_OPEN.load(Ordering::Relaxed)
 }
 
 // ------------------------------------------------------------------ UI lock
+fn restore_hud() {
+    ESC_PASS.store(false, Ordering::Relaxed);
+    let saved = SAVED_HUD.swap(-1, Ordering::Relaxed);
+
+    if saved >= 0 {
+        unsafe { menu_byte(MENU_HUD_ON).write(saved as u8) };
+    }
+
+    if let Ok(mut last) = LAST_HUD.lock() {
+        *last = [i32::MIN; 11];
+    }
+}
+
 pub fn set_ui_locked(lock: bool) {
     let was = UI_LOCK.swap(lock, Ordering::SeqCst);
 
     if was && !lock {
-        ESC_PASS.store(false, Ordering::Relaxed);
-        let saved = SAVED_HUD.swap(-1, Ordering::Relaxed);
-
-        if saved >= 0 {
-            unsafe { menu_byte(MENU_HUD_ON).write(saved as u8) };
-        }
-
-        if let Ok(mut last) = LAST_HUD.lock() {
-            *last = [i32::MIN; 11];
-        }
+        restore_hud();
     }
 
     tracing::info!(locked = lock, "VSL UI lock");
 }
 
 pub fn is_ui_locked() -> bool {
-    UI_LOCK.load(Ordering::Relaxed)
+    UI_LOCK.load(Ordering::Relaxed) && !WD_OPEN.load(Ordering::Relaxed)
+}
+
+// ------------------------------------------------------------------ watchdog
+/// "vsl:beat" from the page
+pub fn beat() {
+    LAST_BEAT_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+fn watchdog(now: u64) {
+    let last_frame = LAST_FRAME_MS.swap(now, Ordering::Relaxed);
+
+    // the game itself stood still (loading, alt-tab): give the page a fresh window
+    if last_frame != 0 && now.saturating_sub(last_frame) > 2000 {
+        LOCK_SINCE_MS.store(now, Ordering::Relaxed);
+
+        if LAST_BEAT_MS.load(Ordering::Relaxed) != 0 {
+            LAST_BEAT_MS.store(now, Ordering::Relaxed);
+        }
+    }
+
+    if !LOCKED.load(Ordering::Relaxed) {
+        WD_OPEN.store(false, Ordering::Relaxed);
+        return;
+    }
+
+    let beat = LAST_BEAT_MS.load(Ordering::Relaxed);
+    let dead = if beat == 0 {
+        now.saturating_sub(LOCK_SINCE_MS.load(Ordering::Relaxed)) > FIRST_BEAT_TIMEOUT_MS
+    } else {
+        now.saturating_sub(beat) > BEAT_TIMEOUT_MS
+    };
+    let was = WD_OPEN.swap(dead, Ordering::Relaxed);
+
+    if dead && !was {
+        restore_chat();
+        restore_hud();
+        tracing::warn!("VSL page is silent: SA-MP chat and GTA HUD shown again");
+    } else if !dead && was {
+        tracing::info!("VSL page is back: locks active again");
+    }
+}
+
+// ------------------------------------------------------------------ quit
+/// leave the game: the network thread gets a moment to send "vsl:ui quit", then the process ends
+pub fn begin_quit() {
+    if QUITTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    QUIT_AT_MS.store(now_ms() + QUIT_DELAY_MS, Ordering::Relaxed);
+    tracing::info!("VSL quit requested");
+}
+
+pub fn is_quitting() -> bool {
+    QUITTING.load(Ordering::Relaxed)
 }
 
 pub fn set_esc_pass(pass: bool) {
@@ -150,9 +239,13 @@ pub fn open_native_menu() {
     unsafe { menu_byte(MENU_ACTIVATE_NEXT).write(1) };
 }
 
-/// SA-MP client command (/q to leave the game)
-pub fn run_client_command(name: &str) {
+/// SA-MP client command (the table SA-MP's own chat uses); true = found and run
+pub fn run_client_command(name: &str, args: &str) -> bool {
     use client_api::samp::inputs::Input;
+
+    if name.is_empty() || name.len() > 32 {
+        return false;
+    }
 
     if let Some(input) = Input::get() {
         unsafe {
@@ -167,14 +260,89 @@ pub fn run_client_command(name: &str) {
 
                 if cmd.eq_ignore_ascii_case(name.as_bytes()) {
                     if let Some(proc_) = procs[i] {
-                        let empty = [0 as std::os::raw::c_char];
-                        proc_(empty.as_ptr());
+                        // SA-MP passes the text after the command (ANSI, max 128)
+                        let mut bytes: Vec<u8> = args
+                            .bytes()
+                            .filter(|&b| b >= 0x20 && b < 0x7F)
+                            .take(128)
+                            .collect();
+                        bytes.push(0);
+                        proc_(bytes.as_ptr() as *const std::os::raw::c_char);
+                        return true;
                     }
 
-                    return;
+                    return false;
                 }
             }
         }
+    }
+
+    false
+}
+
+/// what to do with a line from the VSL chat ("vsl:say" "<channel> <hex text>")
+pub enum SayAction {
+    Forward,
+    Handled,
+    Quit,
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    let t = text.as_bytes();
+
+    if t.len() % 2 != 0 {
+        return None;
+    }
+
+    let val = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+
+    let mut out = Vec::with_capacity(t.len() / 2);
+
+    for pair in t.chunks(2) {
+        out.push((val(pair[0])? << 4) | val(pair[1])?);
+    }
+
+    Some(out)
+}
+
+pub fn client_say(arguments: &str) -> SayAction {
+    let mut parts = arguments.splitn(2, ' ');
+    let _channel = parts.next();
+    let hex = parts.next().unwrap_or("").trim();
+
+    let bytes = match unhex(hex) {
+        Some(b) => b,
+        None => return SayAction::Forward,
+    };
+
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim();
+
+    if !text.starts_with('/') {
+        return SayAction::Forward;
+    }
+
+    let body = &text[1..];
+    let (name, args) = match body.find(' ') {
+        Some(at) => (&body[..at], body[at + 1..].trim()),
+        None => (body, ""),
+    };
+
+    if name.eq_ignore_ascii_case("q") || name.eq_ignore_ascii_case("quit") {
+        return SayAction::Quit;
+    }
+
+    if run_client_command(name, args) {
+        SayAction::Handled
+    } else {
+        SayAction::Forward
     }
 }
 
@@ -187,6 +355,16 @@ fn now_ms() -> u64 {
 
 /// called once per frame from the main loop; returns new HUD values when something changed
 pub fn frame() -> Option<List> {
+    let now = now_ms();
+    let quit_at = QUIT_AT_MS.load(Ordering::Relaxed);
+
+    if quit_at != 0 && now >= quit_at {
+        tracing::info!("VSL quit: closing the game");
+        unsafe { winapi::um::processthreadsapi::ExitProcess(0) };
+    }
+
+    watchdog(now);
+
     if is_locked() {
         if let Some(chat) = chat_ptr() {
             unsafe {
@@ -223,8 +401,6 @@ pub fn frame() -> Option<List> {
     }
 
     // live HUD values, at most ~7 times per second and only when something changed
-    let now = now_ms();
-
     if now.saturating_sub(LAST_HUD_MS.load(Ordering::Relaxed)) < 150 {
         return None;
     }

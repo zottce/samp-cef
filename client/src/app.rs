@@ -250,8 +250,12 @@ impl App {
             crate::external::call_disconnect();
         }
 
-        crate::vsl::set_locked(false); // VSL: give the player his own SA-MP chat / GTA HUD back
-        crate::vsl::set_ui_locked(false);
+        // VSL: give the player his own SA-MP chat / GTA HUD back (shows SA-MP's own kick / ban lines);
+        // not while the game is closing after the VSL quit (no flash of the old chat)
+        if !crate::vsl::is_quitting() {
+            crate::vsl::set_locked(false);
+            crate::vsl::set_ui_locked(false);
+        }
 
         let mut manager = self.manager.lock();
         manager.close_all_browsers();
@@ -448,7 +452,7 @@ pub fn mainloop() {
                             manager.trigger_event("vsl:gamecfg", crate::vsl::game_cfg());
                         }
                         "vsl:nativemenu" => crate::vsl::open_native_menu(),
-                        "vsl:quitgame" => crate::vsl::run_client_command("q"),
+                        "vsl:quitgame" => crate::vsl::begin_quit(),
                         _ => (),
                     }
 
@@ -457,6 +461,32 @@ pub fn mainloop() {
                 }
 
                 Event::EmitEventOnServer(event, arguments) => {
+                    // VSL: page heartbeat (watchdog), quit, SA-MP client commands typed in the VSL chat
+                    match event.as_str() {
+                        "vsl:beat" => {
+                            crate::vsl::beat();
+                            continue;
+                        }
+                        "vsl:say" => match crate::vsl::client_say(&arguments) {
+                            crate::vsl::SayAction::Handled => continue,
+                            crate::vsl::SayAction::Quit => {
+                                crate::vsl::begin_quit();
+
+                                if let Some(network) = app.network.as_mut() {
+                                    network.send(Event::EmitEventOnServer(
+                                        "vsl:ui".to_string(),
+                                        "quit".to_string(),
+                                    ));
+                                }
+
+                                continue;
+                            }
+                            crate::vsl::SayAction::Forward => (),
+                        },
+                        "vsl:ui" if arguments.trim() == "quit" => crate::vsl::begin_quit(),
+                        _ => (),
+                    }
+
                     if let Some(network) = app.network.as_mut() {
                         let event = Event::EmitEventOnServer(event, arguments);
                         network.send(event);

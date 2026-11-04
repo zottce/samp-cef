@@ -20,7 +20,7 @@ cef-sys = { path = "../cef-sys" }
 crossbeam-channel = "0.5.15"
 crossbeam-queue = "0.3.12"
 cpal = "0.18.1"
-winapi = { version = "0.3.9", features = ["d3d9", "winuser", "libloaderapi", "winver", "consoleapi", "memoryapi", "shlobj", "synchapi", "errhandlingapi", "handleapi", "winerror"] }
+winapi = { version = "0.3.9", features = ["d3d9", "winuser", "libloaderapi", "winver", "consoleapi", "memoryapi", "shlobj", "synchapi", "errhandlingapi", "handleapi", "winerror", "processthreadsapi"] }
 messages = { path = "../messages", package = "cef-messages" }
 quick-protobuf = "0.8.1"
 retour = { version = "0.4.0-alpha.4", features = ["thiscall-abi"] }
