@@ -250,6 +250,8 @@ impl App {
             crate::external::call_disconnect();
         }
 
+        crate::vsl::set_locked(false); // VSL: give the player his own SA-MP chat back
+
         let mut manager = self.manager.lock();
         manager.close_all_browsers();
         self.network.take();
@@ -341,6 +343,8 @@ pub fn mainloop() {
             return;
         }
 
+        crate::vsl::frame(); // VSL: keep the old SA-MP chat off while the server locks it
+
         {
             let menu = CMenuManager::get();
             let paused = menu.is_active() || !app.window_focused;
@@ -426,6 +430,10 @@ pub fn mainloop() {
                 }
 
                 Event::EmitEvent(event, list) => {
+                    if event == "vsl:chatlock" {
+                        crate::vsl::set_locked(list.integer(0) == 1);
+                    }
+
                     let manager = app.manager.lock();
                     manager.trigger_event(&event, list);
                 }
@@ -605,6 +613,28 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
             }
 
             WM_KEYDOWN | WM_KEYUP | WM_CHAR | WM_SYSCHAR | WM_SYSKEYDOWN | WM_SYSKEYUP => {
+                // VSL: while the server locks the old chat, T / F6 open the VSL CEF chat instead
+                if crate::vsl::is_locked()
+                    && !manager.is_input_blocked()
+                    && !inputs::Input::is_active()
+                    && !inputs::Dialog::is_input_focused()
+                    && !CMenuManager::is_menu_active()
+                {
+                    if msg == WM_KEYDOWN && crate::vsl::is_chat_key(wparam) {
+                        manager.trigger_event("vsl:chatkey", List::new());
+                        crate::vsl::swallow_next_char();
+                        return true;
+                    }
+
+                    if msg == WM_KEYUP && crate::vsl::is_chat_key(wparam) {
+                        return true;
+                    }
+
+                    if msg == WM_CHAR && crate::vsl::take_swallowed_char() {
+                        return true;
+                    }
+                }
+
                 let is_system_key = msg == WM_SYSCHAR || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP;
 
                 let mut event: cef_key_event_t = unsafe { std::mem::zeroed() };

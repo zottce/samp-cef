@@ -94,6 +94,11 @@ impl ServerCore {
         })
     }
 
+    /// VSL patch: stop the network thread (plugin unload / server exit)
+    pub fn shutdown(&self) {
+        crate::server::shutdown();
+    }
+
     pub fn allow_connection(&mut self, player_id: i32, addr: IpAddr) {
         trace!("allow_connection {} {:?}", player_id, addr);
 

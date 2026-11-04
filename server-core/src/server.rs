@@ -7,8 +7,25 @@ use tracing::trace;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+// VSL patch (2026-11-04): the network thread must stop before the plugin DLL is unloaded at server
+// exit, otherwise the process crashes ("instruction at 0x0") after the gamemode already shut down.
+static STOP: AtomicBool = AtomicBool::new(false);
+static WORKER: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+
+/// stop the network thread and wait for it (the socket and its runtime close with it)
+pub fn shutdown() {
+    STOP.store(true, Ordering::Release);
+
+    let handle = WORKER.lock().ok().and_then(|mut worker| worker.take());
+
+    if let Some(handle) = handle {
+        let _ = handle.join();
+    }
+}
 
 use crate::ServerEvent;
 use crate::client::Client;
@@ -58,8 +75,8 @@ impl Server {
         let server = Arc::new(Mutex::new(server));
         let server_clone = server.clone();
 
-        std::thread::spawn(move || {
-            loop {
+        let handle = std::thread::spawn(move || {
+            while !STOP.load(Ordering::Acquire) {
                 while let Some(event) = socket.recv() {
                     match event {
                         SocketEvent::Message(peer, bytes) => {
@@ -96,6 +113,10 @@ impl Server {
                 std::thread::sleep(Duration::from_millis(5));
             }
         });
+
+        if let Ok(mut worker) = WORKER.lock() {
+            *worker = Some(handle);
+        }
 
         Ok(server_clone)
     }

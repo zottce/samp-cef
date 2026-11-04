@@ -267,6 +267,12 @@ impl SampPlugin for CefPlugin {
         info!("CEF plugin is successful loaded.");
     }
 
+    // VSL patch (2026-11-04): stop the network thread before the DLL goes away (exit crash)
+    fn on_unload(&mut self) {
+        self.core.shutdown();
+        info!("CEF plugin unloaded cleanly.");
+    }
+
     fn on_amx_load(&mut self, amx: &Amx) {
         self.amx_list.push(amx.ident());
     }
