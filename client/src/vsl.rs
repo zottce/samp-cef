@@ -488,6 +488,45 @@ pub fn key_for(wparam: usize) -> Option<VslKey> {
     }
 }
 
+/// GetAsyncKeyState hook: SA-MP also POLLS some keys (chat T / F6, scoreboard TAB, help F1) instead of
+/// reading window messages, so swallowing the message alone is not enough (Owner test 2026-11-06: T opened
+/// the old chat input, F1 the SA-MP key list). While the lock that owns a key is on and no SA-MP input,
+/// SA-MP dialog or GTA menu is using the keyboard, SA-MP sees that key as "not pressed".
+pub fn hides_async_key(key: i32) -> bool {
+    use client_api::gta::menu_manager::CMenuManager;
+    use client_api::samp::inputs::{Dialog, Input};
+
+    let owned = match key {
+        0x54 | 0x75 => is_locked(),                  // T, F6
+        0x09 | 0x70 => is_ui_locked(),               // TAB, F1
+        _ => false,
+    };
+
+    owned && !Input::is_active() && !Dialog::is_input_focused() && !CMenuManager::is_menu_active()
+}
+
+/// diagnostics for the key locks (one line per press of a VSL key, info level)
+pub fn log_key(wparam: usize, input_blocked: bool, routed: bool) {
+    use client_api::gta::menu_manager::CMenuManager;
+    use client_api::samp::inputs::{Dialog, Input};
+
+    if !matches!(wparam, 0x54 | 0x75 | 0x1B | 0x09 | 0x70) {
+        return;
+    }
+
+    tracing::info!(
+        key = wparam,
+        routed,
+        chat_lock = is_locked(),
+        ui_lock = is_ui_locked(),
+        page_focus = input_blocked,
+        samp_input = Input::is_active(),
+        samp_dialog = Dialog::is_input_focused(),
+        gta_menu = CMenuManager::is_menu_active(),
+        "VSL key"
+    );
+}
+
 pub fn event_name(key: &VslKey) -> &'static str {
     match key {
         VslKey::Chat => "vsl:chatkey",

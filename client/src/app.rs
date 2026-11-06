@@ -673,6 +673,7 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
                 {
                     if let Some(key) = crate::vsl::key_for(wparam) {
                         if msg == WM_KEYDOWN {
+                            crate::vsl::log_key(wparam, false, true);
                             manager.trigger_event(crate::vsl::event_name(&key), List::new());
                             crate::vsl::swallow_next_char();
                             return true;
@@ -686,6 +687,14 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
                     if msg == WM_CHAR && crate::vsl::take_swallowed_char() {
                         return true;
                     }
+                }
+
+                if msg == WM_KEYDOWN
+                    && (lparam >> 30) & 1 == 0
+                    && (crate::vsl::is_locked() || crate::vsl::is_ui_locked())
+                    && !(manager.is_input_blocked() && wparam == 0x54)
+                {
+                    crate::vsl::log_key(wparam, manager.is_input_blocked(), false);   // a VSL key the page did not get
                 }
 
                 let is_system_key = msg == WM_SYSCHAR || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP;
@@ -791,6 +800,11 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
 extern "stdcall" fn async_key_state(key: i32) -> u16 {
     if let Some(app) = App::get() {
         let result = app.keystate_hook.call(key);
+
+        // VSL: keys the VSL pages own are never seen as pressed by SA-MP's own polling
+        if crate::vsl::hides_async_key(key) {
+            return 0;
+        }
 
         if let Some(manager) = app.manager.try_lock() {
             if manager.is_input_blocked() {
